@@ -5,6 +5,14 @@ require "uri"
 require "dotenv/load"
 
 API_URL = URI("https://openrouter.ai/api/v1/chat/completions")
+DEBUG = ENV["DEBUG"] != "0"
+
+def debug(label, data = nil)
+  return unless DEBUG
+  line = "[debug] #{label}"
+  line += " #{data.is_a?(String) ? data : JSON.dump(data)}" unless data.nil?
+  warn line
+end
 
 module Weather
   GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -89,21 +97,34 @@ def call_llm(messages)
     tools: TOOL_SCHEMAS
   )
 
+  debug "→ POST #{API_URL.host} (#{messages.size} msgs, last=#{messages.last[:role] || messages.last['role']})"
+
   http = Net::HTTP.new(API_URL.host, API_URL.port)
   http.use_ssl = true
   res = http.request(req)
   raise "LLM error #{res.code}: #{res.body}" unless res.code.to_i == 200
 
-  JSON.parse(res.body).dig("choices", 0, "message")
+  msg = JSON.parse(res.body).dig("choices", 0, "message")
+  if msg["tool_calls"]&.any?
+    names = msg["tool_calls"].map { |tc| tc.dig("function", "name") }
+    debug "← assistant wants tools: #{names.join(', ')}"
+  else
+    preview = msg["content"].to_s.gsub(/\s+/, " ")[0, 120]
+    debug "← assistant content (#{msg['content'].to_s.length} chars): #{preview}"
+  end
+  msg
 end
 
 def run_tool(call)
   name = call.dig("function", "name")
   raw = call.dig("function", "arguments")
   args = (raw.nil? || raw.empty?) ? {} : JSON.parse(raw)
+  debug "  tool call: #{name}(#{args.map { |k, v| "#{k}=#{v.inspect}" }.join(', ')})"
   tool = TOOLS[name]
   return { error: "unknown tool #{name}" } unless tool
-  tool.call(**args.transform_keys(&:to_sym))
+  result = tool.call(**args.transform_keys(&:to_sym))
+  debug "  tool result:", result
+  result
 end
 
 def ask(messages, user_input)
