@@ -4,7 +4,6 @@ require "json"
 require "uri"
 require "dotenv/load"
 
-API_URL = URI("https://openrouter.ai/api/v1/chat/completions")
 DEBUG = ENV["DEBUG"] != "0"
 
 def debug(label, data = nil)
@@ -12,6 +11,27 @@ def debug(label, data = nil)
   line = "[debug] #{label}"
   line += " #{data.is_a?(String) ? data : JSON.dump(data)}" unless data.nil?
   warn line
+end
+
+module Http
+  module_function
+
+  def get_json(url, **params)
+    uri = URI(url)
+    uri.query = URI.encode_www_form(params)
+    JSON.parse(Net::HTTP.get(uri))
+  end
+
+  def post_json(url, headers:, body:)
+    uri = URI(url)
+    req = Net::HTTP::Post.new(uri, headers.merge("Content-Type" => "application/json"))
+    req.body = JSON.dump(body)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == "https")
+    res = http.request(req)
+    raise "HTTP #{res.code}: #{res.body}" unless res.code.to_i == 200
+    JSON.parse(res.body)
+  end
 end
 
 module Weather
@@ -48,15 +68,15 @@ module Weather
   end
 
   def geocode(name)
-    get_json(GEOCODE_URL, name: name, count: 1, language: "en", format: "json")
-      .dig("results", 0)
+    Http.get_json(GEOCODE_URL, name: name, count: 1, language: "en", format: "json")
+        .dig("results", 0)
   end
 
   def fetch_current(place)
-    get_json(FORECAST_URL,
-             latitude: place["latitude"],
-             longitude: place["longitude"],
-             current: CURRENT_FIELDS).fetch("current")
+    Http.get_json(FORECAST_URL,
+                  latitude: place["latitude"],
+                  longitude: place["longitude"],
+                  current: CURRENT_FIELDS).fetch("current")
   end
 
   def format_current(place, current)
@@ -69,80 +89,82 @@ module Weather
       observed_at: current["time"]
     }
   end
+end
 
-  def get_json(base, **params)
-    uri = URI(base)
-    uri.query = URI.encode_www_form(params)
-    JSON.parse(Net::HTTP.get(uri))
+module Tools
+  REGISTRY = { "weather" => Weather }
+  SCHEMAS = REGISTRY.values.map { |t| t::SCHEMA }
+
+  module_function
+
+  def run(tool_call)
+    name = tool_call.dig("function", "name")
+    raw = tool_call.dig("function", "arguments")
+    args = (raw.nil? || raw.empty?) ? {} : JSON.parse(raw)
+    debug "  tool call: #{name}(#{args.map { |k, v| "#{k}=#{v.inspect}" }.join(', ')})"
+
+    tool = REGISTRY[name]
+    return { error: "unknown tool #{name}" } unless tool
+
+    result = tool.call(**args.transform_keys(&:to_sym))
+    debug "  tool result:", result
+    result
   end
 end
 
-TOOLS = { "weather" => Weather }
-TOOL_SCHEMAS = TOOLS.values.map { |t| t::SCHEMA }
+module LLM
+  API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+  module_function
+
+  def chat(messages)
+    debug "→ POST openrouter.ai (#{messages.size} msgs, last=#{messages.last['role']})"
+
+    body = Http.post_json(
+      API_URL,
+      headers: { "Authorization" => "Bearer #{ENV.fetch('OPENROUTER_API_KEY')}" },
+      body: { model: ENV.fetch("LLM_DEFAULT_MODEL"),
+              messages: messages,
+              tools: Tools::SCHEMAS }
+    )
+
+    msg = body.dig("choices", 0, "message")
+    log_reply(msg)
+    msg
+  end
+
+  def log_reply(msg)
+    if msg["tool_calls"]&.any?
+      names = msg["tool_calls"].map { |tc| tc.dig("function", "name") }
+      debug "← assistant wants tools: #{names.join(', ')}"
+    else
+      content = msg["content"].to_s
+      preview = content.gsub(/\s+/, " ")[0, 120]
+      debug "← assistant content (#{content.length} chars): #{preview}"
+    end
+  end
+end
 
 SYSTEM_PROMPT = <<~PROMPT
   You are a terminal assistant. Use the weather tool whenever the user asks
-  about current weather, temperature, wind, or humidity for a place. Keep
-  answers concise.
+  about current weather, temperature, wind, or humidity for a place.
 PROMPT
 
-def call_llm(messages)
-  req = Net::HTTP::Post.new(API_URL, {
-    "Authorization" => "Bearer #{ENV.fetch('OPENROUTER_API_KEY')}",
-    "Content-Type" => "application/json"
-  })
-  req.body = JSON.dump(
-    model: ENV.fetch("LLM_DEFAULT_MODEL"),
-    messages: messages,
-    tools: TOOL_SCHEMAS
-  )
-
-  debug "→ POST #{API_URL.host} (#{messages.size} msgs, last=#{messages.last[:role] || messages.last['role']})"
-
-  http = Net::HTTP.new(API_URL.host, API_URL.port)
-  http.use_ssl = true
-  res = http.request(req)
-  raise "LLM error #{res.code}: #{res.body}" unless res.code.to_i == 200
-
-  msg = JSON.parse(res.body).dig("choices", 0, "message")
-  if msg["tool_calls"]&.any?
-    names = msg["tool_calls"].map { |tc| tc.dig("function", "name") }
-    debug "← assistant wants tools: #{names.join(', ')}"
-  else
-    preview = msg["content"].to_s.gsub(/\s+/, " ")[0, 120]
-    debug "← assistant content (#{msg['content'].to_s.length} chars): #{preview}"
-  end
-  msg
-end
-
-def run_tool(call)
-  name = call.dig("function", "name")
-  raw = call.dig("function", "arguments")
-  args = (raw.nil? || raw.empty?) ? {} : JSON.parse(raw)
-  debug "  tool call: #{name}(#{args.map { |k, v| "#{k}=#{v.inspect}" }.join(', ')})"
-  tool = TOOLS[name]
-  return { error: "unknown tool #{name}" } unless tool
-  result = tool.call(**args.transform_keys(&:to_sym))
-  debug "  tool result:", result
-  result
-end
-
 def ask(messages, user_input)
-  messages << { role: "user", content: user_input }
+  messages << { "role" => "user", "content" => user_input }
 
   loop do
-    msg = call_llm(messages)
+    msg = LLM.chat(messages)
     messages << msg
 
     tool_calls = msg["tool_calls"]
     return msg["content"] if tool_calls.nil? || tool_calls.empty?
 
     tool_calls.each do |tc|
-      result = run_tool(tc)
       messages << {
-        role: "tool",
-        tool_call_id: tc["id"],
-        content: JSON.dump(result)
+        "role" => "tool",
+        "tool_call_id" => tc["id"],
+        "content" => JSON.dump(Tools.run(tc))
       }
     end
   end
@@ -150,7 +172,7 @@ end
 
 def run_repl
   puts "ruby AI agent — type 'exit' or Ctrl-D to quit"
-  messages = [{ role: "system", content: SYSTEM_PROMPT }]
+  messages = [{ "role" => "system", "content" => SYSTEM_PROMPT }]
 
   loop do
     print "\n> "
@@ -161,8 +183,7 @@ def run_repl
     break if %w[exit quit].include?(msg)
 
     begin
-      reply = ask(messages, msg)
-      puts reply
+      puts ask(messages, msg)
     rescue Interrupt
       puts "\n[interrupted]"
     rescue => error
